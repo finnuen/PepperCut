@@ -1,0 +1,6 @@
+{
+  "name": "PepperCut",
+  "description": "Standalone Windows 10 C++ Win32 background utility that unlocks files and folders held by other processes from the Explorer right-click menu and manages boot-time deletion.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

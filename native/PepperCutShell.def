@@ -1,0 +1,4 @@
+LIBRARY "PepperCutShell.dll"
+EXPORTS
+    DllGetClassObject PRIVATE
+    DllCanUnloadNow PRIVATE
