@@ -12,6 +12,7 @@
 #define ID_TRAY_ICON            1001
 #define IDM_TRAY_EXIT           2001
 #define IDM_TRAY_IGNORE_WIN     2002
+#define IDM_TRAY_START_BOOT     2003
 #define IDI_PEPPERCUT_ICON      101
 
 #define COPYDATA_NOTIFY_START        1
@@ -460,7 +461,7 @@ void InstallAndRegisterShellExtension() {
     RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\Classes\\Directory\\shell\\PepperCutBootDelete");
 
     // 2. Save settings into %APPDATA%\PepperCut\settings.ini
-    //    Ensure "Ignore important windows file and folder" is ON by default (1)
+    //    Ensure "Start on boot" and "Ignore important windows file and folder" are ON by default (1)
     wchar_t szDir[MAX_PATH] = {};
     GetPepperCutAppDataDir(szDir, MAX_PATH);
 
@@ -468,6 +469,11 @@ void InstallAndRegisterShellExtension() {
     GetPepperCutSettingsIniPath(szSettingsIni, MAX_PATH);
     WritePrivateProfileStringW(L"PepperCut", L"Version", kAppVersion, szSettingsIni);
     WritePrivateProfileStringW(L"PepperCut", L"ExePath", g_szExePath, szSettingsIni);
+
+    wchar_t szExistingStartBoot[16] = {};
+    if (GetPrivateProfileStringW(L"PepperCut", L"StartOnBoot", L"", szExistingStartBoot, ARRAYSIZE(szExistingStartBoot), szSettingsIni) == 0) {
+        WritePrivateProfileStringW(L"PepperCut", L"StartOnBoot", L"1", szSettingsIni);
+    }
 
     wchar_t szExistingIgnore[16] = {};
     if (GetPrivateProfileStringW(L"PepperCut", L"IgnoreImportantWindows", L"", szExistingIgnore, ARRAYSIZE(szExistingIgnore), szSettingsIni) == 0) {
@@ -611,27 +617,21 @@ void NotifyRunningTrayOrFallback(DWORD notifyCode, const wchar_t* szFallbackMess
 
 // ----------------------------------------------------------------------------
 // Start on Boot by Default (HKCU\Software\Microsoft\Windows\CurrentVersion\Run)
+// Synced with %APPDATA%\PepperCut\settings.ini (ON by default)
 // ----------------------------------------------------------------------------
 void EnsureStartOnBootEnabled() {
-    wchar_t szQuoted[MAX_PATH + 8] = {};
-    StringCchPrintfW(szQuoted, ARRAYSIZE(szQuoted), L"\"%s\"", g_szExePath);
-
-    HKEY hKey = NULL;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, kRunRegKey, 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
-        RegSetValueExW(
-            hKey,
-            kAppName,
-            0,
-            REG_SZ,
-            reinterpret_cast<const BYTE*>(szQuoted),
-            static_cast<DWORD>((wcslen(szQuoted) + 1) * sizeof(wchar_t))
-        );
-        RegCloseKey(hKey);
+    wchar_t szSettingsIni[MAX_PATH] = {};
+    GetPepperCutSettingsIniPath(szSettingsIni, MAX_PATH);
+    wchar_t szExistingStartBoot[16] = {};
+    if (GetPrivateProfileStringW(L"PepperCut", L"StartOnBoot", L"", szExistingStartBoot, ARRAYSIZE(szExistingStartBoot), szSettingsIni) == 0) {
+        WritePrivateProfileStringW(L"PepperCut", L"StartOnBoot", L"1", szSettingsIni);
     }
+    bool startOnBoot = IsStartOnBootEnabled();
+    SyncStartOnBootRegistry(startOnBoot, g_szExePath);
 }
 
 // ----------------------------------------------------------------------------
-// System Tray Hidden Window Procedure (Right-click shows ONLY "Exit")
+// System Tray Hidden Window Procedure
 // ----------------------------------------------------------------------------
 LRESULT CALLBACK HiddenTrayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static UINT s_uTaskbarRestart = 0;
@@ -668,8 +668,15 @@ LRESULT CALLBACK HiddenTrayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
             GetCursorPos(&pt);
             SetForegroundWindow(hWnd);
 
-            bool ignoreWin = IsIgnoreImportantWindowsEnabled();
+            bool startOnBoot = IsStartOnBootEnabled();
+            bool ignoreWin   = IsIgnoreImportantWindowsEnabled();
             HMENU hMenu = CreatePopupMenu();
+            AppendMenuW(
+                hMenu,
+                MF_STRING | (startOnBoot ? MF_CHECKED : MF_UNCHECKED),
+                IDM_TRAY_START_BOOT,
+                L"Start on boot"
+            );
             AppendMenuW(
                 hMenu,
                 MF_STRING | (ignoreWin ? MF_CHECKED : MF_UNCHECKED),
@@ -690,7 +697,9 @@ LRESULT CALLBACK HiddenTrayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
             );
             DestroyMenu(hMenu);
 
-            if (cmd == IDM_TRAY_IGNORE_WIN) {
+            if (cmd == IDM_TRAY_START_BOOT) {
+                SetStartOnBootEnabled(!startOnBoot, g_szExePath);
+            } else if (cmd == IDM_TRAY_IGNORE_WIN) {
                 SetIgnoreImportantWindowsEnabled(!ignoreWin);
             } else if (cmd == IDM_TRAY_EXIT) {
                 Shell_NotifyIconW(NIM_DELETE, &g_nid);

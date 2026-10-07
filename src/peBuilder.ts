@@ -27,7 +27,7 @@ export interface PeBinaryInspection {
 
 export const REAL_PEPPERCUT_EXE_METADATA: PeBinaryInspection = {
   fileName: 'PepperCut.exe',
-  fileSizeBytes: 513536,
+  fileSizeBytes: 515584,
   compiler: 'x86_64-w64-mingw32-g++ 12.2.0 (-O2 -s -static -mwindows -municode)',
   architecture: 'x86-64 (PE32+ AMD64, HAS_RELOC)',
   subsystem: 'IMAGE_SUBSYSTEM_WINDOWS_GUI (Windows 10)',

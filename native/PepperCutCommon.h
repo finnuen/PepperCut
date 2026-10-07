@@ -153,6 +153,46 @@ inline std::wstring MakeIniKeyFromPath(const wchar_t* szPath) {
 }
 
 // ----------------------------------------------------------------------------
+// "Start on boot" setting (ON by default = 1)
+// Saved in %APPDATA%\PepperCut\settings.ini and synced with HKCU\...\Run
+// ----------------------------------------------------------------------------
+inline bool IsStartOnBootEnabled() {
+    wchar_t szIni[MAX_PATH] = {};
+    GetPepperCutSettingsIniPath(szIni, MAX_PATH);
+    UINT val = GetPrivateProfileIntW(L"PepperCut", L"StartOnBoot", 1 /* ON by default */, szIni);
+    return (val != 0);
+}
+
+inline void SyncStartOnBootRegistry(bool enabled, const wchar_t* szExePath) {
+    static const wchar_t* kRunKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+    HKEY hKey = NULL;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kRunKey, 0, NULL, 0, KEY_SET_VALUE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+        if (enabled && szExePath && *szExePath) {
+            wchar_t szQuoted[MAX_PATH + 8] = {};
+            StringCchPrintfW(szQuoted, ARRAYSIZE(szQuoted), L"\"%s\"", szExePath);
+            RegSetValueExW(
+                hKey,
+                kAppName,
+                0,
+                REG_SZ,
+                reinterpret_cast<const BYTE*>(szQuoted),
+                static_cast<DWORD>((wcslen(szQuoted) + 1) * sizeof(wchar_t))
+            );
+        } else {
+            RegDeleteValueW(hKey, kAppName);
+        }
+        RegCloseKey(hKey);
+    }
+}
+
+inline void SetStartOnBootEnabled(bool enabled, const wchar_t* szExePath) {
+    wchar_t szIni[MAX_PATH] = {};
+    GetPepperCutSettingsIniPath(szIni, MAX_PATH);
+    WritePrivateProfileStringW(L"PepperCut", L"StartOnBoot", enabled ? L"1" : L"0", szIni);
+    SyncStartOnBootRegistry(enabled, szExePath);
+}
+
+// ----------------------------------------------------------------------------
 // "Ignore important windows file and folder" setting (ON by default = 1)
 // Saved in %APPDATA%\PepperCut\settings.ini
 // ----------------------------------------------------------------------------

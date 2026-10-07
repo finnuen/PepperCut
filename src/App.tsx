@@ -884,12 +884,25 @@ export default function App() {
                     20:02
                   </div>
 
-                  {/* Tray Right-Click Popup Menu: 'Ignore important windows file and folder' toggle + 'Exit' */}
+                  {/* Tray Right-Click Popup Menu: 'Start on boot' toggle + 'Ignore important windows file and folder' toggle + 'Exit' */}
                   {trayMenuOpen && isTrayRunning && (
                     <div
                       onClick={(e) => e.stopPropagation()}
                       className="absolute bottom-10 right-12 w-72 bg-[#2B2B2B] border border-neutral-600 rounded shadow-xl py-1 z-50"
                     >
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setStartOnBootReg((v) => !v);
+                          setTrayMenuOpen(false);
+                        }}
+                        className="w-full px-3 py-1.5 text-left text-xs text-white hover:bg-neutral-700 transition-colors flex items-center gap-2.5 cursor-pointer"
+                      >
+                        <span className="w-4 h-4 flex items-center justify-center text-emerald-400 shrink-0">
+                          {startOnBootReg ? <Check className="w-3.5 h-3.5" /> : null}
+                        </span>
+                        <span className="whitespace-nowrap">Start on boot</span>
+                      </button>
                       <button
                         type="button"
                         onClick={() => {
