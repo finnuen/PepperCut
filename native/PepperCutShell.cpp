@@ -12,6 +12,24 @@
 
 static LONG g_cDllRef = 0;
 
+// COM objects are allocated straight from the process heap. `new` would pull in
+// the C++ runtime's operator new, and with it static libstdc++ - which is an
+// order of magnitude bigger than the code in this DLL. Placement new itself is
+// an inline overload in <new> and costs nothing.
+template <typename T>
+static T* AllocObject() {
+    void* pMem = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(T));
+    if (!pMem) return nullptr;
+    return new (pMem) T();
+}
+
+template <typename T>
+static void FreeObject(T* pObj) {
+    if (!pObj) return;
+    pObj->~T();
+    HeapFree(GetProcessHeap(), 0, pObj);
+}
+
 // Helper to read PepperCut.exe path stored in %APPDATA%\PepperCut\settings.ini
 static bool GetPepperCutExePath(wchar_t* outExePath, DWORD cchMax) {
     wchar_t szIni[MAX_PATH] = {};
@@ -71,7 +89,7 @@ public:
     IFACEMETHODIMP_(ULONG) Release() override {
         ULONG cRef = InterlockedDecrement(&m_cRef);
         if (cRef == 0) {
-            delete this;
+            FreeObject(this);
         }
         return cRef;
     }
@@ -254,14 +272,14 @@ public:
     IFACEMETHODIMP_(ULONG) Release() override {
         ULONG cRef = InterlockedDecrement(&m_cRef);
         if (cRef == 0) {
-            delete this;
+            FreeObject(this);
         }
         return cRef;
     }
 
     IFACEMETHODIMP CreateInstance(IUnknown* pUnkOuter, REFIID riid, void** ppv) override {
         if (pUnkOuter) return CLASS_E_NOAGGREGATION;
-        PepperCutContextMenu* pExt = new (std::nothrow) PepperCutContextMenu();
+        PepperCutContextMenu* pExt = AllocObject<PepperCutContextMenu>();
         if (!pExt) return E_OUTOFMEMORY;
         HRESULT hr = pExt->QueryInterface(riid, ppv);
         pExt->Release();
@@ -281,7 +299,7 @@ extern "C" HRESULT STDAPICALLTYPE DllGetClassObject(REFCLSID rclsid, REFIID riid
     if (!IsEqualCLSID(rclsid, CLSID_PepperCutShellExt)) {
         return CLASS_E_CLASSNOTAVAILABLE;
     }
-    PepperCutClassFactory* pFactory = new (std::nothrow) PepperCutClassFactory();
+    PepperCutClassFactory* pFactory = AllocObject<PepperCutClassFactory>();
     if (!pFactory) return E_OUTOFMEMORY;
     HRESULT hr = pFactory->QueryInterface(riid, ppv);
     pFactory->Release();

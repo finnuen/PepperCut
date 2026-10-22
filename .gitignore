@@ -6,3 +6,8 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# native build output
+native/*.o
+native/*.exe
+native/PepperCutShell.dll

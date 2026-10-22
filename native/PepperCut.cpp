@@ -4,7 +4,6 @@
 // ============================================================================
 
 #include "PepperCutCommon.h"
-#include "EmbeddedShellDll.h"
 #include <winternl.h>
 
 #define WM_TRAYICON             (WM_APP + 1)
@@ -14,14 +13,15 @@
 #define IDM_TRAY_IGNORE_WIN     2002
 #define IDM_TRAY_START_BOOT     2003
 #define IDI_PEPPERCUT_ICON      101
+#define IDR_SHELL_DLL           200
 
 #define COPYDATA_NOTIFY_START        1
 #define COPYDATA_NOTIFY_FILE_DISC    2
 #define COPYDATA_NOTIFY_FOLDER_DISC  3
 #define COPYDATA_NOTIFY_BOOT_DEL     4
 #define COPYDATA_NOTIFY_BOOT_CANCEL  5
+#define COPYDATA_NOTIFY_FAIL         6
 
-static const wchar_t* kRunRegKey        = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 static const wchar_t* kRunOnceRegKey    = L"Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce";
 
 NOTIFYICONDATAW g_nid                 = {};
@@ -101,12 +101,14 @@ HICON LoadOrCreatePepperCutIcon() {
     return hIcon ? hIcon : LoadIconW(NULL, IDI_APPLICATION);
 }
 
-bool PathMatchesOrIsChild(const std::wstring& handlePathNorm, const std::wstring& targetNorm, bool isDirectory) {
-    if (handlePathNorm.empty() || targetNorm.empty()) return false;
-    if (handlePathNorm == targetNorm) return true;
-    if (isDirectory && handlePathNorm.size() > targetNorm.size()) {
-        if (handlePathNorm.compare(0, targetNorm.size(), targetNorm) == 0 &&
-            handlePathNorm[targetNorm.size()] == L'\\') {
+bool PathMatchesOrIsChild(const wchar_t* handlePathNorm, const wchar_t* targetNorm, bool isDirectory) {
+    if (!handlePathNorm || !targetNorm || !*handlePathNorm || !*targetNorm) return false;
+    if (wcscmp(handlePathNorm, targetNorm) == 0) return true;
+    if (isDirectory) {
+        size_t targetLen = wcslen(targetNorm);
+        if (wcslen(handlePathNorm) > targetLen &&
+            wcsncmp(handlePathNorm, targetNorm, targetLen) == 0 &&
+            handlePathNorm[targetLen] == L'\\') {
             return true;
         }
     }
@@ -114,49 +116,106 @@ bool PathMatchesOrIsChild(const std::wstring& handlePathNorm, const std::wstring
 }
 
 // ----------------------------------------------------------------------------
-// Persistent Worker Thread for SafeGetHandleDiskPath
+// Resolving a duplicated handle to a disk path.
+//
+// GetFinalPathNameByHandleW blocks in the kernel for as long as the underlying
+// device takes to answer, which on a dead network share or an ejected drive is
+// forever. The query therefore runs on a worker thread with a timeout.
+//
+// A worker that overstays its timeout is *abandoned, never terminated*:
+// TerminateThread can leave the heap lock or a loader lock held inside this
+// process and crash the next allocation. The abandoned thread keeps its handle
+// and finishes whenever the kernel returns; it is simply never reused.
 // ----------------------------------------------------------------------------
-static HANDLE  g_hWorkerReqEvent  = NULL;
-static HANDLE  g_hWorkerDoneEvent = NULL;
-static HANDLE  g_hWorkerThread    = NULL;
-static HANDLE  g_hQueryTarget     = NULL;
-static wchar_t g_szQueryResult[MAX_PATH] = {};
-static DWORD   g_dwQueryLen       = 0;
+namespace {
 
-DWORD WINAPI HandlePathWorkerProc(LPVOID) {
-    while (WaitForSingleObject(g_hWorkerReqEvent, INFINITE) == WAIT_OBJECT_0) {
-        g_dwQueryLen = 0;
-        if (g_hQueryTarget && GetFileType(g_hQueryTarget) == FILE_TYPE_DISK) {
-            g_dwQueryLen = GetFinalPathNameByHandleW(g_hQueryTarget, g_szQueryResult, MAX_PATH, VOLUME_NAME_DOS);
+constexpr DWORD  kPathQueryTimeoutMs = 150;
+constexpr size_t kMaxPathWorkers     = 8;
+
+struct PathWorker {
+    HANDLE  hReq      = NULL;
+    HANDLE  hDone     = NULL;
+    HANDLE  hThread   = NULL;
+    HANDLE  hTarget   = NULL;      // owned by the worker once hReq is signalled
+    wchar_t szResult[MAX_PATH] = {};
+    DWORD   dwLen     = 0;
+    bool    abandoned = false;
+};
+
+// Fixed pool: no allocation, so <new> and the C++ runtime stay out of the exe.
+PathWorker g_pathWorkers[kMaxPathWorkers];
+size_t     g_pathWorkerCount = 0;
+
+DWORD WINAPI HandlePathWorkerProc(LPVOID param) {
+    PathWorker* w = static_cast<PathWorker*>(param);
+    while (WaitForSingleObject(w->hReq, INFINITE) == WAIT_OBJECT_0) {
+        HANDLE hTarget = w->hTarget;
+        w->hTarget = NULL;
+        w->dwLen = 0;
+        w->szResult[0] = L'\0';
+        if (hTarget) {
+            if (GetFileType(hTarget) == FILE_TYPE_DISK) {
+                DWORD cch = GetFinalPathNameByHandleW(hTarget, w->szResult, MAX_PATH, VOLUME_NAME_DOS);
+                w->dwLen = (cch > 0 && cch < MAX_PATH) ? cch : 0;
+            }
+            CloseHandle(hTarget);
         }
-        SetEvent(g_hWorkerDoneEvent);
+        SetEvent(w->hDone);
     }
     return 0;
 }
 
-bool SafeGetHandleDiskPath(HANDLE hLocal, std::wstring& outNormPath) {
-    if (!g_hWorkerReqEvent) {
-        g_hWorkerReqEvent  = CreateEventW(NULL, FALSE, FALSE, NULL);
-        g_hWorkerDoneEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
-    }
-    if (!g_hWorkerThread) {
-        g_hWorkerThread = CreateThread(NULL, 0, HandlePathWorkerProc, NULL, 0, NULL);
-    }
-    if (!g_hWorkerThread) return false;
+PathWorker* CreatePathWorker() {
+    if (g_pathWorkerCount >= kMaxPathWorkers) return nullptr;
 
-    g_hQueryTarget = hLocal;
-    SetEvent(g_hWorkerReqEvent);
+    PathWorker* w = &g_pathWorkers[g_pathWorkerCount];
+    w->hReq  = CreateEventW(NULL, FALSE, FALSE, NULL);
+    w->hDone = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (w->hReq && w->hDone) {
+        w->hThread = CreateThread(NULL, 0, HandlePathWorkerProc, w, 0, NULL);
+    }
+    if (!w->hThread) {
+        if (w->hReq)  CloseHandle(w->hReq);
+        if (w->hDone) CloseHandle(w->hDone);
+        return nullptr;
+    }
+    ++g_pathWorkerCount;
+    return w;
+}
 
-    if (WaitForSingleObject(g_hWorkerDoneEvent, 4) == WAIT_TIMEOUT) {
-        TerminateThread(g_hWorkerThread, 1);
-        CloseHandle(g_hWorkerThread);
-        g_hWorkerThread = NULL;
+PathWorker* AcquirePathWorker() {
+    for (size_t i = 0; i < g_pathWorkerCount; ++i) {
+        if (!g_pathWorkers[i].abandoned) return &g_pathWorkers[i];
+    }
+    return CreatePathWorker();
+}
+
+} // namespace
+
+// Takes ownership of hLocal: the worker closes it, or keeps it open for ever
+// when the query is abandoned. Callers must not close it afterwards.
+bool SafeGetHandleDiskPath(HANDLE hLocal, wchar_t* outNormPath, size_t cchMax) {
+    if (cchMax) outNormPath[0] = L'\0';
+
+    PathWorker* w = AcquirePathWorker();
+    if (!w) {
+        // No worker left to hand the handle to: nobody else will close it.
+        CloseHandle(hLocal);
         return false;
     }
 
-    if (g_dwQueryLen == 0 || g_dwQueryLen >= MAX_PATH) return false;
-    outNormPath = NormalizePathCommon(g_szQueryResult);
-    return !outNormPath.empty();
+    w->hTarget = hLocal;
+    SetEvent(w->hReq);
+
+    if (WaitForSingleObject(w->hDone, kPathQueryTimeoutMs) != WAIT_OBJECT_0) {
+        // Stuck in device I/O. Retire the worker without killing it.
+        w->abandoned = true;
+        return false;
+    }
+
+    if (w->dwLen == 0) return false;
+    NormalizePathCommon(w->szResult, outNormPath, cchMax);
+    return outNormPath[0] != L'\0';
 }
 
 // ----------------------------------------------------------------------------
@@ -172,25 +231,38 @@ bool CloseMatchingSystemHandles(const wchar_t* szTargetPath, bool isDirectory) {
     HANDLE hProbeSelf = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
 
     ULONG bufSize = 1024 * 1024;
-    std::vector<BYTE> buffer(bufSize);
+    BYTE* buffer = static_cast<BYTE*>(HeapAlloc(GetProcessHeap(), 0, bufSize));
+    if (!buffer) {
+        if (hProbeSelf != INVALID_HANDLE_VALUE) CloseHandle(hProbeSelf);
+        return false;
+    }
     ULONG returnLen = 0;
     NTSTATUS status = 0;
 
-    while ((status = NtQuerySysInfo(64, buffer.data(), bufSize, &returnLen)) == (NTSTATUS)0xC0000004L) {
-        bufSize = returnLen ? (returnLen + 65536) : (bufSize * 2);
-        if (bufSize > 64 * 1024 * 1024) {
+    while ((status = NtQuerySysInfo(64, buffer, bufSize, &returnLen)) == (NTSTATUS)0xC0000004L) {
+        ULONG newSize = returnLen ? (returnLen + 65536) : (bufSize * 2);
+        if (newSize > 64 * 1024 * 1024) {
+            HeapFree(GetProcessHeap(), 0, buffer);
             if (hProbeSelf != INVALID_HANDLE_VALUE) CloseHandle(hProbeSelf);
             return false;
         }
-        buffer.resize(bufSize);
+        BYTE* bigger = static_cast<BYTE*>(HeapReAlloc(GetProcessHeap(), 0, buffer, newSize));
+        if (!bigger) {
+            HeapFree(GetProcessHeap(), 0, buffer);
+            if (hProbeSelf != INVALID_HANDLE_VALUE) CloseHandle(hProbeSelf);
+            return false;
+        }
+        buffer = bigger;
+        bufSize = newSize;
     }
     if (status < 0) {
+        HeapFree(GetProcessHeap(), 0, buffer);
         if (hProbeSelf != INVALID_HANDLE_VALUE) CloseHandle(hProbeSelf);
         return false;
     }
 
     DWORD selfPid = GetCurrentProcessId();
-    PSYSTEM_HANDLE_INFORMATION_EX pInfo = reinterpret_cast<PSYSTEM_HANDLE_INFORMATION_EX>(buffer.data());
+    PSYSTEM_HANDLE_INFORMATION_EX pInfo = reinterpret_cast<PSYSTEM_HANDLE_INFORMATION_EX>(buffer);
 
     USHORT fileTypeIndex = 0xFFFF;
     if (hProbeSelf != INVALID_HANDLE_VALUE) {
@@ -204,23 +276,28 @@ bool CloseMatchingSystemHandles(const wchar_t* szTargetPath, bool isDirectory) {
         CloseHandle(hProbeSelf);
     }
 
-    std::wstring targetNorm = NormalizePathCommon(szTargetPath);
-    if (targetNorm.empty()) return false;
+    wchar_t targetNorm[MAX_PATH] = {};
+    NormalizePathCommon(szTargetPath, targetNorm, ARRAYSIZE(targetNorm));
+    if (targetNorm[0] == L'\0') return false;
 
     bool closedAny = false;
     ULONG_PTR lastPid = 0;
+    bool lastPidProtected = true;
     HANDLE hProc = NULL;
-    ULONG timedOutAccessMask = 0xFFFFFFFF;
 
     for (ULONG_PTR i = 0; i < pInfo->NumberOfHandles; ++i) {
         const auto& entry = pInfo->Handles[i];
         if (fileTypeIndex != 0xFFFF && entry.ObjectTypeIndex != fileTypeIndex) {
             continue;
         }
-        if (entry.GrantedAccess == 0x0012019F ||
-            entry.GrantedAccess == 0x00120189 ||
-            entry.GrantedAccess == 0x00120089 ||
-            entry.GrantedAccess == timedOutAccessMask) {
+        // Only handles that grant data or delete access can be holding the
+        // item open. The old filter skipped 0x0012019F as well, which is
+        // exactly GENERIC_READ|GENERIC_WRITE - the access mask of the process
+        // that actually locks the file - so nothing was ever released unless
+        // the owning process was killed.
+        constexpr ULONG kDataOrDelete =
+            FILE_READ_DATA | FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE;
+        if ((entry.GrantedAccess & kDataOrDelete) == 0) {
             continue;
         }
 
@@ -228,36 +305,43 @@ bool CloseMatchingSystemHandles(const wchar_t* szTargetPath, bool isDirectory) {
         if (pid <= 4 || pid == selfPid) continue;
 
         if (pid != lastPid) {
-            if (hProc) CloseHandle(hProc);
-            hProc = OpenProcess(PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)pid);
+            if (hProc) {
+                CloseHandle(hProc);
+                hProc = NULL;
+            }
             lastPid = pid;
-            timedOutAccessMask = 0xFFFFFFFF;
+            lastPidProtected = IsProtectedProcess(static_cast<DWORD>(pid));
+            if (!lastPidProtected) {
+                hProc = OpenProcess(PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)pid);
+            }
         }
-        if (!hProc) continue;
+        if (lastPidProtected || !hProc) continue;
 
         HANDLE hLocal = NULL;
         if (DuplicateHandle(hProc, (HANDLE)entry.HandleValue, GetCurrentProcess(), &hLocal, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
-            std::wstring handleNorm;
-            if (SafeGetHandleDiskPath(hLocal, handleNorm)) {
+            wchar_t handleNorm[MAX_PATH] = {};
+            if (SafeGetHandleDiskPath(hLocal, handleNorm, ARRAYSIZE(handleNorm))) {
                 if (PathMatchesOrIsChild(handleNorm, targetNorm, isDirectory)) {
-                    CloseHandle(hLocal);
-                    hLocal = NULL;
                     if (DuplicateHandle(hProc, (HANDLE)entry.HandleValue, NULL, NULL, 0, FALSE, DUPLICATE_CLOSE_SOURCE)) {
                         closedAny = true;
                     }
                 }
-            } else if (!g_hWorkerThread) {
-                timedOutAccessMask = entry.GrantedAccess;
             }
-            if (hLocal) CloseHandle(hLocal);
         }
     }
     if (hProc) CloseHandle(hProc);
+    HeapFree(GetProcessHeap(), 0, buffer);
     return closedAny;
 }
 
 // ----------------------------------------------------------------------------
-// Disconnect a File or Folder from whatever application is using it
+// Disconnect a File or Folder from whatever application is using it.
+//
+// This only *releases handles*; it never terminates a process. Killing the app
+// that holds a file throws away whatever that app had not saved yet, which is
+// not what "disconnect" promises. If a window still owns the item afterwards
+// it is asked to close politely, and if the lock survives that the call reports
+// failure so the user is told the truth.
 // ----------------------------------------------------------------------------
 bool DisconnectPathFromProcesses(const wchar_t* szPath, bool* pOutIsDirectory) {
     if (IsIgnoreImportantWindowsEnabled() && IsImportantWindowsPath(szPath)) {
@@ -268,136 +352,133 @@ bool DisconnectPathFromProcesses(const wchar_t* szPath, bool* pOutIsDirectory) {
     bool isDirectory = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
     if (pOutIsDirectory) *pOutIsDirectory = isDirectory;
 
-    // Step 1: Close all open file/folder handles in remote processes non-destructively
+    // Step 1: close the file/folder handles held by other processes.
     CloseMatchingSystemHandles(szPath, isDirectory);
 
-    // Step 2: Close any application windows (e.g. Notepad, Paint, Photos) holding the item open
+    // Step 2: a visible window whose title carries the item (Notepad, Paint,
+    // Photos) still owns it through its own handle. Ask it to close and let it
+    // decide - an unsaved document will show its own save prompt.
     DWORD winPid = 0;
     HWND  winHwnd = NULL;
-    while (HasWindowWithOpenItemTitle(szPath, &winPid, &winHwnd)) {
-        DWORD_PTR dwRes = 0;
-        SendMessageTimeoutW(winHwnd, WM_CLOSE, 0, 0, SMTO_ABORTIFHUNG, 300, &dwRes);
-        HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, winPid);
-        if (hProc) {
-            TerminateProcess(hProc, 0);
-            CloseHandle(hProc);
-        }
-        break;
+    if (HasWindowWithOpenItemTitle(szPath, &winPid, &winHwnd) && !IsProtectedProcess(winPid)) {
+        SendMessageTimeoutW(winHwnd, WM_CLOSE, 0, 0, SMTO_ABORTIFHUNG, 1000, NULL);
     }
 
-    // Step 3: Use Windows Restart Manager to release any remaining locks
-    std::vector<std::wstring> resources;
-    std::vector<std::wstring> childDirs;
-    if (isDirectory) {
-        CollectItemsInFolderCommon(szPath, resources, childDirs, 0);
-    } else {
-        resources.push_back(szPath);
-    }
-
-    if (!resources.empty()) {
-        std::vector<PCWSTR> ptrs;
-        for (const auto& r : resources) ptrs.push_back(r.c_str());
-
-        DWORD dwSession = 0;
-        wchar_t szSessionKey[CCH_RM_SESSION_KEY + 1] = {};
-        if (RmStartSession(&dwSession, 0, szSessionKey) == ERROR_SUCCESS) {
-            if (RmRegisterResources(dwSession, (UINT)ptrs.size(), ptrs.data(), 0, NULL, 0, NULL) == ERROR_SUCCESS) {
-                UINT nNeeded = 0, nCount = 16;
-                DWORD dwReason = RmRebootReasonNone;
-                std::vector<RM_PROCESS_INFO> rgpi(nCount);
-                DWORD res = RmGetList(dwSession, &nNeeded, &nCount, rgpi.data(), &dwReason);
-                if (res == ERROR_MORE_DATA) {
-                    nCount = nNeeded;
-                    rgpi.resize(nCount);
-                    res = RmGetList(dwSession, &nNeeded, &nCount, rgpi.data(), &dwReason);
-                }
-                if (res == ERROR_SUCCESS && nCount > 0) {
-                    DWORD selfPid = GetCurrentProcessId();
-                    DWORD explorerPid = 0;
-                    if (GetShellWindow()) GetWindowThreadProcessId(GetShellWindow(), &explorerPid);
-
-                    for (UINT i = 0; i < nCount; ++i) {
-                        DWORD pid = rgpi[i].Process.dwProcessId;
-                        if (pid != selfPid && pid != explorerPid) {
-                            if (IsPathUsedByOtherAppCommon(szPath)) {
-                                HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
-                                if (hProc) {
-                                    TerminateProcess(hProc, 0);
-                                    CloseHandle(hProc);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            RmEndSession(dwSession);
-        }
-    }
-    return true;
+    // Step 3: report whether the item is actually free now.
+    return !IsPathUsedByOtherAppCommon(szPath);
 }
 
 // ----------------------------------------------------------------------------
 // Boot-Time Deletion Management ("Delete on next boot" / "Cancel delete on next boot")
 // Saved in %APPDATA%\PepperCut\boot_delete.ini
 // ----------------------------------------------------------------------------
+
+// Walks a tree children-first and hands every path to `visit`, so a directory is
+// never scheduled ahead of the files it still holds. Junctions and symlinks are
+// visited themselves, never walked into: following one would queue the contents
+// of an entirely different tree for deletion.
+typedef void (*BootDeleteVisitor)(const wchar_t* path, void* ctx);
+
+void WalkTreeChildrenFirst(const wchar_t* path, BootDeleteVisitor visit, void* ctx, int depth = 0) {
+    if (!path || !*path || depth > 64) return;
+
+    DWORD attrs = GetFileAttributesW(path);
+    if (attrs == INVALID_FILE_ATTRIBUTES) return;
+
+    if (!(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        visit(path, ctx);
+        return;
+    }
+
+    wchar_t pattern[MAX_PATH] = {};
+    StringCchPrintfW(pattern, ARRAYSIZE(pattern), L"%s\\*", path);
+
+    WIN32_FIND_DATAW fd = {};
+    HANDLE hFind = FindFirstFileW(pattern, &fd);
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+
+            wchar_t child[MAX_PATH] = {};
+            StringCchPrintfW(child, ARRAYSIZE(child), L"%s\\%s", path, fd.cFileName);
+
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+                visit(child, ctx);
+            } else {
+                WalkTreeChildrenFirst(child, visit, ctx, depth + 1);
+            }
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+    }
+
+    visit(path, ctx); // the directory itself goes last
+}
+
+void ScheduleBootDeleteVisit(const wchar_t* path, void*) {
+    MoveFileExW(path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+}
+
 bool ToggleBootDelete(const wchar_t* szPath, bool* pOutScheduled) {
     if (IsIgnoreImportantWindowsEnabled() && IsImportantWindowsPath(szPath) && !IsScheduledForBootDeleteCommon(szPath)) {
         return false;
     }
-    std::wstring key = MakeIniKeyFromPath(szPath);
-    if (key.empty()) return false;
+    wchar_t szKey[MAX_PATH] = {};
+    MakeIniKeyFromPath(szPath, szKey, ARRAYSIZE(szKey));
+    if (szKey[0] == L'\0') return false;
 
     wchar_t szBootIni[MAX_PATH] = {};
     GetPepperCutBootDeleteIniPath(szBootIni, MAX_PATH);
 
     if (IsScheduledForBootDeleteCommon(szPath)) {
-        WritePrivateProfileStringW(L"BootDelete", key.c_str(), NULL, szBootIni);
+        WritePrivateProfileStringW(L"BootDelete", szKey, NULL, szBootIni);
         if (pOutScheduled) *pOutScheduled = false;
         return true;
-    } else {
-        MoveFileExW(szPath, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
-        WritePrivateProfileStringW(L"BootDelete", key.c_str(), szPath, szBootIni);
-
-        HKEY hRunOnce = NULL;
-        if (RegCreateKeyExW(HKEY_CURRENT_USER, kRunOnceRegKey, 0, NULL, 0, KEY_WRITE, NULL, &hRunOnce, NULL) == ERROR_SUCCESS) {
-            wchar_t szCmd[MAX_PATH + 32] = {};
-            StringCchPrintfW(szCmd, ARRAYSIZE(szCmd), L"\"%s\" --run-boot-deletes", g_szExePath);
-            RegSetValueExW(
-                hRunOnce,
-                L"PepperCutBootCleanup",
-                0,
-                REG_SZ,
-                reinterpret_cast<const BYTE*>(szCmd),
-                static_cast<DWORD>((wcslen(szCmd) + 1) * sizeof(wchar_t))
-            );
-            RegCloseKey(hRunOnce);
-        }
-        if (pOutScheduled) *pOutScheduled = true;
-        return true;
     }
+
+    // Hand the whole tree to the kernel for the next restart. This is the real
+    // "delete on next boot": it runs before any process can lock the files
+    // again. The call needs administrator rights, so it is expected to fail for
+    // a normal user - the logon sweep registered below is the fallback.
+    WalkTreeChildrenFirst(szPath, ScheduleBootDeleteVisit, NULL);
+
+    WritePrivateProfileStringW(L"BootDelete", szKey, szPath, szBootIni);
+
+    HKEY hRunOnce = NULL;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kRunOnceRegKey, 0, NULL, 0, KEY_WRITE, NULL, &hRunOnce, NULL) == ERROR_SUCCESS) {
+        wchar_t szCmd[MAX_PATH + 32] = {};
+        StringCchPrintfW(szCmd, ARRAYSIZE(szCmd), L"\"%s\" --run-boot-deletes", g_szExePath);
+        RegSetValueExW(
+            hRunOnce,
+            L"PepperCutBootCleanup",
+            0,
+            REG_SZ,
+            reinterpret_cast<const BYTE*>(szCmd),
+            static_cast<DWORD>((wcslen(szCmd) + 1) * sizeof(wchar_t))
+        );
+        RegCloseKey(hRunOnce);
+    }
+    if (pOutScheduled) *pOutScheduled = true;
+    return true;
 }
 
-void RecursiveDeleteDirectory(const std::wstring& dirPath) {
-    std::wstring pattern = dirPath + L"\\*";
-    WIN32_FIND_DATAW fd = {};
-    HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
-    if (hFind != INVALID_HANDLE_VALUE) {
-        do {
-            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
-            std::wstring child = dirPath + L"\\" + fd.cFileName;
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-                RecursiveDeleteDirectory(child);
-            } else {
-                SetFileAttributesW(child.c_str(), FILE_ATTRIBUTE_NORMAL);
-                DeleteFileW(child.c_str());
-            }
-        } while (FindNextFileW(hFind, &fd));
-        FindClose(hFind);
-    }
-    SetFileAttributesW(dirPath.c_str(), FILE_ATTRIBUTE_NORMAL);
-    RemoveDirectoryW(dirPath.c_str());
+// Removes a path through the shell so it lands in the Recycle Bin and can be
+// restored. Used by the logon sweep only.
+void RecyclePath(const wchar_t* szPath) {
+    wchar_t list[MAX_PATH + 1] = {}; // SHFileOperation wants a double-terminated list
+    StringCchCopyW(list, MAX_PATH, szPath);
+
+    SHFILEOPSTRUCTW op = {};
+    op.wFunc  = FO_DELETE;
+    op.pFrom  = list;
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI | FOF_NOCONFIRMMKDIR;
+    SHFileOperationW(&op);
 }
 
+// Fallback sweep for queued deletions that the kernel could not schedule
+// (no administrator rights). Runs once per logon through HKCU\...\RunOnce.
+// It only deletes what is still there: no process is touched, nothing is
+// disconnected and nothing is force-closed, because at logon the lock that
+// originally blocked the item is normally gone on its own.
 void ProcessPendingBootDeletesOnStartup() {
     wchar_t szBootIni[MAX_PATH] = {};
     GetPepperCutBootDeleteIniPath(szBootIni, MAX_PATH);
@@ -405,29 +486,30 @@ void ProcessPendingBootDeletesOnStartup() {
         return;
     }
 
-    std::vector<wchar_t> keyBuf(32768, L'\0');
-    DWORD cchKeys = GetPrivateProfileStringW(L"BootDelete", NULL, L"", keyBuf.data(), static_cast<DWORD>(keyBuf.size()), szBootIni);
-    if (cchKeys == 0) return;
+    // The key list can be large, so it is a transient heap block rather than a
+    // static buffer: a zero-filled static one would be written into the image.
+    constexpr DWORD kKeyBufChars = 32768;
+    wchar_t* pKeys = static_cast<wchar_t*>(HeapAlloc(GetProcessHeap(), 0, kKeyBufChars * sizeof(wchar_t)));
+    if (!pKeys) return;
 
-    const wchar_t* pKey = keyBuf.data();
+    DWORD cchKeys = GetPrivateProfileStringW(L"BootDelete", NULL, L"", pKeys, kKeyBufChars, szBootIni);
+    if (cchKeys == 0) {
+        HeapFree(GetProcessHeap(), 0, pKeys);
+        return;
+    }
+
+    const wchar_t* pKey = pKeys;
     while (*pKey) {
         wchar_t szTargetPath[MAX_PATH] = {};
         if (GetPrivateProfileStringW(L"BootDelete", pKey, L"", szTargetPath, MAX_PATH, szBootIni) > 0 && szTargetPath[0] != L'\0') {
-            DWORD attrs = GetFileAttributesW(szTargetPath);
-            if (attrs != INVALID_FILE_ATTRIBUTES) {
-                bool isDir = false;
-                DisconnectPathFromProcesses(szTargetPath, &isDir);
-                if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
-                    RecursiveDeleteDirectory(szTargetPath);
-                } else {
-                    SetFileAttributesW(szTargetPath, FILE_ATTRIBUTE_NORMAL);
-                    DeleteFileW(szTargetPath);
-                }
+            if (GetFileAttributesW(szTargetPath) != INVALID_FILE_ATTRIBUTES) {
+                RecyclePath(szTargetPath);
             }
             WritePrivateProfileStringW(L"BootDelete", pKey, NULL, szBootIni);
         }
         pKey += wcslen(pKey) + 1;
     }
+    HeapFree(GetProcessHeap(), 0, pKeys);
 }
 
 // ----------------------------------------------------------------------------
@@ -481,22 +563,32 @@ void InstallAndRegisterShellExtension() {
     }
 
     // 3. Extract PepperCutShell.dll into %APPDATA%\PepperCut\PepperCutShell.dll
+    //    The DLL travels as an RCDATA resource, so the bytes come straight out
+    //    of the image instead of out of a compiled hex array.
     wchar_t szDllPath[MAX_PATH] = {};
     StringCchPrintfW(szDllPath, ARRAYSIZE(szDllPath), L"%s\\PepperCutShell.dll", szDir);
 
-    // If an old copy is loaded in explorer.exe, rename it to .old first so we can write the new one
-    HANDLE hFile = CreateFileW(szDllPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        wchar_t szOldDll[MAX_PATH] = {};
-        StringCchPrintfW(szOldDll, ARRAYSIZE(szOldDll), L"%s\\PepperCutShell.old.dll", szDir);
-        DeleteFileW(szOldDll);
-        MoveFileExW(szDllPath, szOldDll, MOVEFILE_REPLACE_EXISTING);
-        hFile = CreateFileW(szDllPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    }
-    if (hFile != INVALID_HANDLE_VALUE) {
-        DWORD dwWritten = 0;
-        WriteFile(hFile, kEmbeddedShellDll, kEmbeddedShellDllSize, &dwWritten, NULL);
-        CloseHandle(hFile);
+    HMODULE hSelf = GetModuleHandleW(NULL);
+    HRSRC hRes = FindResourceW(hSelf, MAKEINTRESOURCEW(IDR_SHELL_DLL), RT_RCDATA);
+    HGLOBAL hResData = hRes ? LoadResource(hSelf, hRes) : NULL;
+    const void* pShellDll = hResData ? LockResource(hResData) : NULL;
+    DWORD cbShellDll = hRes ? SizeofResource(hSelf, hRes) : 0;
+
+    if (pShellDll && cbShellDll > 0) {
+        // If an old copy is loaded in explorer.exe, rename it to .old first so we can write the new one
+        HANDLE hFile = CreateFileW(szDllPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hFile == INVALID_HANDLE_VALUE) {
+            wchar_t szOldDll[MAX_PATH] = {};
+            StringCchPrintfW(szOldDll, ARRAYSIZE(szOldDll), L"%s\\PepperCutShell.old.dll", szDir);
+            DeleteFileW(szOldDll);
+            MoveFileExW(szDllPath, szOldDll, MOVEFILE_REPLACE_EXISTING);
+            hFile = CreateFileW(szDllPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        }
+        if (hFile != INVALID_HANDLE_VALUE) {
+            DWORD dwWritten = 0;
+            WriteFile(hFile, pShellDll, cbShellDll, &dwWritten, NULL);
+            CloseHandle(hFile);
+        }
     }
 
     // 4. Register COM CLSID under HKCU\Software\Classes\CLSID\{E8F4B9A1-7C3D-4E2A-9B1E-6D5F8A3C2E10}
@@ -659,6 +751,12 @@ LRESULT CALLBACK HiddenTrayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
         case COPYDATA_NOTIFY_BOOT_DEL:
             ShowTrayNotification(L"File will be deleted on next boot");
             break;
+        case COPYDATA_NOTIFY_BOOT_CANCEL:
+            ShowTrayNotification(L"Delete on next boot cancelled");
+            break;
+        case COPYDATA_NOTIFY_FAIL:
+            ShowTrayNotification(L"Still in use - nothing was disconnected");
+            break;
         }
         return 0;
 
@@ -740,20 +838,27 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
 
             if (wcscmp(mode, L"--disconnect") == 0) {
                 bool isFolder = false;
-                DisconnectPathFromProcesses(targetPath, &isFolder);
-                NotifyRunningTrayOrFallback(
-                    isFolder ? COPYDATA_NOTIFY_FOLDER_DISC : COPYDATA_NOTIFY_FILE_DISC,
-                    isFolder ? L"Folder has been disconnected" : L"File has been disconnected"
-                );
+                bool released = DisconnectPathFromProcesses(targetPath, &isFolder);
+                if (released) {
+                    NotifyRunningTrayOrFallback(
+                        isFolder ? COPYDATA_NOTIFY_FOLDER_DISC : COPYDATA_NOTIFY_FILE_DISC,
+                        isFolder ? L"Folder has been disconnected" : L"File has been disconnected"
+                    );
+                } else {
+                    NotifyRunningTrayOrFallback(COPYDATA_NOTIFY_FAIL, L"Still in use - nothing was disconnected");
+                }
                 LocalFree(argv);
                 return 0;
             }
 
             if (wcscmp(mode, L"--boot-delete") == 0) {
                 bool nowScheduled = false;
-                ToggleBootDelete(targetPath, &nowScheduled);
-                if (nowScheduled) {
+                if (!ToggleBootDelete(targetPath, &nowScheduled)) {
+                    NotifyRunningTrayOrFallback(COPYDATA_NOTIFY_FAIL, L"This location is protected");
+                } else if (nowScheduled) {
                     NotifyRunningTrayOrFallback(COPYDATA_NOTIFY_BOOT_DEL, L"File will be deleted on next boot");
+                } else {
+                    NotifyRunningTrayOrFallback(COPYDATA_NOTIFY_BOOT_CANCEL, L"Delete on next boot cancelled");
                 }
                 LocalFree(argv);
                 return 0;
@@ -768,8 +873,10 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     // Extract & register our COM IContextMenu Shell Extension DLL
     InstallAndRegisterShellExtension();
 
-    // Process any pending boot deletions queued by PepperCut
-    ProcessPendingBootDeletesOnStartup();
+    // NOTE: the boot-delete queue is drained only by the --run-boot-deletes
+    // invocation registered in RunOnce. It must never run here: doing so would
+    // delete "delete on next boot" items the moment the user re-launches
+    // PepperCut, which is not what was promised.
 
     // Single-instance check: if already running in tray, trigger startup notification and exit
     HWND hExisting = FindWindowW(kWndClassName, NULL);

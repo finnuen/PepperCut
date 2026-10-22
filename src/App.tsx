@@ -17,6 +17,11 @@ import { REAL_PEPPERCUT_EXE_METADATA } from './peBuilder';
 import { renderIconPixelsRGBA } from './icoBuilder';
 import { PEPPERCUT_CPP_SOURCE } from './cppSource';
 
+// The published binary carries its version in the filename; both here and in
+// native/build.ps1 it comes from kAppVersion, which is the single record.
+const EXE_VERSION = '1.1';
+const EXE_FILE_NAME = `PepperCut_v${EXE_VERSION}.exe`;
+
 export function PepperCutIcon({ className = 'w-5 h-5' }: { className?: string }) {
   return (
     <svg
@@ -187,9 +192,9 @@ export default function App() {
     ctx.putImageData(imgData, 0, 0);
   }, []);
 
-  // Load first 256 bytes of real compiled /PepperCut.exe for the hex inspector
+  // Load first 256 bytes of the real compiled binary for the hex inspector
   useEffect(() => {
-    fetch('/PepperCut.exe?v=1.0')
+    fetch(`/${EXE_FILE_NAME}?v=${EXE_VERSION}`)
       .then((res) => res.arrayBuffer())
       .then((buf) => {
         const slice = new Uint8Array(buf, 0, Math.min(256, buf.byteLength));
@@ -229,11 +234,11 @@ export default function App() {
     setNotifications((prev) => [newNotif, ...prev.slice(0, 3)]);
   };
 
-  // Download the real MinGW-w64 compiled /PepperCut.exe
+  // Download the real MinGW-w64 compiled binary
   const handleDownloadExe = () => {
     const a = document.createElement('a');
-    a.href = `/PepperCut.exe?v=${Date.now()}`;
-    a.download = 'PepperCut.exe';
+    a.href = `/${EXE_FILE_NAME}?v=${Date.now()}`;
+    a.download = EXE_FILE_NAME;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -445,7 +450,7 @@ export default function App() {
             className="flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-[#DC2626] rounded-lg hover:bg-red-700 transition-colors whitespace-nowrap cursor-pointer"
           >
             <Download className="w-4 h-4" />
-            <span>Download PepperCut.exe</span>
+            <span>Download {EXE_FILE_NAME}</span>
           </button>
         </div>
       </header>
@@ -469,18 +474,18 @@ export default function App() {
                 className="text-2xl md:text-3xl font-bold tracking-tight text-white"
                 style={{ textWrap: 'balance' }}
               >
-                PepperCut v1.0 — Standalone Windows 10 Executable
+                PepperCut v{EXE_VERSION} - Standalone Windows 10 Executable
               </h1>
               <p className="text-sm text-slate-300 leading-relaxed">
                 Compiled with <code className="text-slate-100">x86_64-w64-mingw32-g++ -static -mwindows -municode</code> into
-                a ready-to-use 64-bit Windows 10 executable (<code className="text-slate-100">PepperCut.exe</code>).
+                a ready-to-use 64-bit Windows 10 executable (<code className="text-slate-100">{EXE_FILE_NAME}</code>).
                 Starts on boot in the system tray with <strong className="text-white">Ignore important windows file and folder</strong> enabled by default,
                 saves settings and boot-delete queues to <code className="text-slate-100">%appdata%\PepperCut</code>, and shows
                 right-click options only when a file or folder is locked by another app.
               </p>
               {/* Unboxed Metadata with · separators */}
               <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400 font-mono tabular-nums pt-1">
-                <span>Version: 1.0 (x64 PE32+)</span>
+                <span>Version: {EXE_VERSION} (x64 PE32+)</span>
                 <span aria-hidden="true">·</span>
                 <span>Size: {inspection.fileSizeBytes.toLocaleString()} bytes</span>
                 <span aria-hidden="true">·</span>
@@ -498,7 +503,7 @@ export default function App() {
               className="flex items-center justify-center gap-2.5 px-6 py-3.5 text-sm font-semibold text-white bg-[#DC2626] rounded-lg hover:bg-red-700 transition-colors whitespace-nowrap cursor-pointer shadow-sm"
             >
               <Download className="w-4 h-4" />
-              <span>Download PepperCut.exe (v1.0)</span>
+              <span>Download {EXE_FILE_NAME}</span>
             </button>
             <button
               type="button"
@@ -551,7 +556,7 @@ export default function App() {
 
           <div className="flex items-center gap-3 text-xs text-slate-400 font-mono tabular-nums">
             <span>
-              Version: 1.0
+              Version: {EXE_VERSION}
             </span>
             <span aria-hidden="true">·</span>
             <span>
@@ -565,7 +570,7 @@ export default function App() {
               <>
                 <span aria-hidden="true">·</span>
                 <span className="text-emerald-400">
-                  Downloaded PepperCut.exe ({downloadCount}x)
+                  Downloaded {EXE_FILE_NAME} ({downloadCount}x)
                 </span>
               </>
             )}
@@ -1014,7 +1019,7 @@ export default function App() {
               <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-800 pb-4">
                 <div>
                   <h2 className="text-base font-semibold text-white">
-                    PE32+ Executable Verification (PepperCut.exe)
+                    PE32+ Executable Verification ({EXE_FILE_NAME})
                   </h2>
                   <p className="text-xs text-slate-400">
                     Compiled with {inspection.compiler}. Statically linked with full ASLR relocation table (`.reloc`) and x64 unwind tables (`.pdata` / `.xdata`).
@@ -1026,7 +1031,7 @@ export default function App() {
                   className="flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-[#DC2626] rounded-lg hover:bg-red-700 transition-colors cursor-pointer"
                 >
                   <Download className="w-3.5 h-3.5" />
-                  <span>Download PepperCut.exe (282.5 KB)</span>
+                  <span>Download {EXE_FILE_NAME} (109 KB)</span>
                 </button>
               </div>
 
@@ -1055,7 +1060,7 @@ export default function App() {
 
               <div className="space-y-2">
                 <h3 className="text-xs font-semibold text-slate-300">
-                  PE32+ Section Headers (objdump -h PepperCut.exe)
+                  PE32+ Section Headers (objdump -h {EXE_FILE_NAME})
                 </h3>
                 <div className="overflow-x-auto border border-slate-800 rounded-lg">
                   <table className="w-full text-left border-collapse text-xs font-mono tabular-nums">
@@ -1113,7 +1118,7 @@ export default function App() {
               {hexDumpRows.length > 0 && (
                 <div className="space-y-2">
                   <h3 className="text-xs font-semibold text-slate-300">
-                    Binary Header Hex Dump (First 256 Bytes of Compiled PepperCut.exe)
+                    Binary Header Hex Dump (First 256 Bytes of Compiled {EXE_FILE_NAME})
                   </h3>
                   <div className="p-4 bg-slate-950 border border-slate-800 rounded-lg overflow-x-auto font-mono text-xs tabular-nums leading-relaxed">
                     {hexDumpRows.map((row) => (
@@ -1141,7 +1146,7 @@ export default function App() {
                   PepperCut.cpp — Pure 100% C++ & Win32 Implementation
                 </h2>
                 <p className="text-xs text-slate-400">
-                  Exact C++ source code compiled into <code className="text-slate-200">PepperCut.exe</code> via MinGW-w64 GCC 12.2.
+                  Exact C++ source code compiled into <code className="text-slate-200">{EXE_FILE_NAME}</code> via MinGW-w64 GCC 16.2 (-Os -s -static).
                 </p>
               </div>
               <div className="flex items-center gap-2">
@@ -1194,7 +1199,7 @@ export default function App() {
               onClick={handleDownloadExe}
               className="text-slate-300 hover:text-white transition-colors cursor-pointer"
             >
-              Download PepperCut.exe
+              Download {EXE_FILE_NAME}
             </button>
             <span aria-hidden="true">·</span>
             <button

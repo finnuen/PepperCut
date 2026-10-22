@@ -2,9 +2,14 @@
 
 101 ICON "PepperCut.ico"
 
+// The shell extension DLL, carried as a plain binary resource. It used to be
+// converted to a 1.2 MB "0xNN," hex header at build time; a resource embeds the
+// same bytes without the text round-trip.
+200 RCDATA "PepperCutShell.dll"
+
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     1,0,0,0
-PRODUCTVERSION  1,0,0,0
+FILEVERSION     1,1,0,0
+PRODUCTVERSION  1,1,0,0
 FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
 FILEFLAGS       0x0L
 FILEOS          VOS_NT_WINDOWS32
@@ -16,12 +21,12 @@ BEGIN
         BLOCK "040904B0"
         BEGIN
             VALUE "CompanyName",      "PepperCut\0"
-            VALUE "FileDescription",  "PepperCut v1.0 - File and Folder Unlocker\0"
-            VALUE "FileVersion",      "1.0\0"
+            VALUE "FileDescription",  "PepperCut v1.1 - File and Folder Unlocker\0"
+            VALUE "FileVersion",      "1.1\0"
             VALUE "InternalName",     "PepperCut.exe\0"
-            VALUE "OriginalFilename", "PepperCut.exe\0"
+            VALUE "OriginalFilename", "PepperCut_v1.1.exe\0"
             VALUE "ProductName",      "PepperCut\0"
-            VALUE "ProductVersion",   "1.0\0"
+            VALUE "ProductVersion",   "1.1\0"
         END
     END
     BLOCK "VarFileInfo"
